@@ -2,23 +2,32 @@
 // You should copy it to another filename to avoid overwriting it.
 
 #include "match_server/Match.h"
+#include "save_client/Save.h"
+#include <thrift/concurrency/ThreadManager.h>
+#include <thrift/concurrency/ThreadFactory.h>
 #include <thrift/protocol/TBinaryProtocol.h>
 #include <thrift/server/TSimpleServer.h>
+#include <thrift/server/TThreadedServer.h>
 #include <thrift/transport/TServerSocket.h>
 #include <thrift/transport/TBufferTransports.h>
+#include <thrift/transport/TTransportUtils.h>
+#include <thrift/transport/TSocket.h>
+#include <thrift/TToString.h>
 
 #include <iostream>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
 #include <queue>
+#include <unistd.h>
 
 using namespace ::apache::thrift;
 using namespace ::apache::thrift::protocol;
 using namespace ::apache::thrift::transport;
 using namespace ::apache::thrift::server;
 
-using namespace  ::match_service;
+using namespace ::match_service;
+using namespace ::save_service;
 using namespace std;
 
 // 增加或删除用户
@@ -43,24 +52,77 @@ class Pool
         void save_result(int a, int b)
         {
             printf("Match Result: %d %d\n", a, b);
+
+            // 数据存储的客户端代码，修改服务器地址
+            std::shared_ptr<TTransport> socket(new TSocket("123.57.47.211", 9090));
+            std::shared_ptr<TTransport> transport(new TBufferedTransport(socket));
+            std::shared_ptr<TProtocol> protocol(new TBinaryProtocol(transport));
+            SaveClient client(protocol);
+
+            try {
+                transport->open();
+
+                int res = client.save_data("acs_333", "fc23079b", a, b);
+
+                if (!res) puts("success");
+                else    puts("failed");
+
+                transport->close();
+            } catch (TException& tx) {
+                cout << "ERROR: " << tx.what() << endl;
+            }
         }
 
-        // 每次对匹配池中的前两位进行匹配
+        bool check_match(uint32_t i, uint32_t j)
+        {
+            auto a = users[i], b = users[j];
+
+            int dt = abs(a.score - b.score);
+            int a_max_dif = wt[i] * 50;
+            int b_max_dif = wt[j] * 50;
+
+            return dt <= a_max_dif && dt <= b_max_dif;
+        }
+
+        // 对分值不超过50的两名玩家进行匹配
         void match()
         {
+            // 等待秒数+1
+            for (uint32_t i = 0; i < wt.size(); i ++)
+                wt[i] ++;
+
             while (users.size() > 1)
             {
-                auto a = users[0], b = users[1];
-                users.erase(users.begin());
-                users.erase(users.begin());
+                bool flag = true;
 
-                save_result(a.id, b.id);
+                for (uint32_t i = 0; i < users.size(); i ++)
+                {
+                    for (uint32_t j = i + 1; j < users.size(); j ++)
+                    {
+                        if (check_match(i, j))
+                        {
+                            auto a = users[i], b = users[j];
+                            users.erase(users.begin() + j);
+                            users.erase(users.begin() + i);
+                            wt.erase(wt.begin() + j);
+                            wt.erase(wt.begin() + i);
+                            save_result(a.id, b.id);
+                            flag = false;
+                            break;
+                        }
+                    }
+
+                    if (!flag) break;
+                }
+
+                if (flag)   break;
             }
         }
 
         void add(User user)
         {
             users.push_back(user);
+            wt.push_back(0);
         }
 
         void remove(User user)
@@ -69,11 +131,13 @@ class Pool
                 if (users[i].id == user.id)
                 {
                     users.erase(users.begin() + i);
+                    wt.erase(wt.begin() + i);
                     break;
                 }
         }
     private:
         vector<User> users;
+        vector<int> wt; // 当前玩家等待匹配的时间，单位秒
 }pool;
 
 class MatchHandler : virtual public MatchIf {
@@ -106,6 +170,24 @@ class MatchHandler : virtual public MatchIf {
 
 };
 
+class MatchCloneFactory : virtual public MatchIfFactory {
+    public:
+        ~MatchCloneFactory() override = default;
+        MatchIf* getHandler(const ::apache::thrift::TConnectionInfo& connInfo) override
+        {
+            std::shared_ptr<TSocket> sock = std::dynamic_pointer_cast<TSocket>(connInfo.transport);
+            /*cout << "Incoming connection\n";
+            cout << "\tSocketInfo: "  << sock->getSocketInfo() << "\n";
+            cout << "\tPeerHost: "    << sock->getPeerHost() << "\n";
+            cout << "\tPeerAddress: " << sock->getPeerAddress() << "\n";
+            cout << "\tPeerPort: "    << sock->getPeerPort() << "\n";*/
+            return new MatchHandler;
+        }
+        void releaseHandler(MatchIf* handler) override {
+            delete handler;
+        }
+};
+
 void consume_task()
 {
     while (true)
@@ -113,7 +195,11 @@ void consume_task()
         unique_lock<mutex> lck(message_queue.m);
         if (message_queue.q.empty())
         {
-            message_queue.cv.wait(lck); // 条件变量等待线程
+            //message_queue.cv.wait(lck); // 条件变量等待线程
+            // 每1秒钟匹配一次
+            lck.unlock();
+            pool.match();
+            sleep(1);
         }
         else
         {
@@ -123,21 +209,16 @@ void consume_task()
 
             if (task.type == "add") pool.add(task.user);
             else if (task.type == "remove") pool.remove(task.user);
-
-            pool.match();
         }
     }
 }
 
 int main(int argc, char **argv) {
-    int port = 9090;
-    ::std::shared_ptr<MatchHandler> handler(new MatchHandler());
-    ::std::shared_ptr<TProcessor> processor(new MatchProcessor(handler));
-    ::std::shared_ptr<TServerTransport> serverTransport(new TServerSocket(port));
-    ::std::shared_ptr<TTransportFactory> transportFactory(new TBufferedTransportFactory());
-    ::std::shared_ptr<TProtocolFactory> protocolFactory(new TBinaryProtocolFactory());
-
-    TSimpleServer server(processor, serverTransport, transportFactory, protocolFactory);
+    TThreadedServer server(
+            std::make_shared<MatchProcessorFactory>(std::make_shared<MatchCloneFactory>()),
+            std::make_shared<TServerSocket>(9090), //port
+            std::make_shared<TBufferedTransportFactory>(),
+            std::make_shared<TBinaryProtocolFactory>());
 
     cout << "Start Match Server" << endl;
 
